@@ -111,6 +111,8 @@ namespace StackExchange.Redis
 
         public static readonly ResultProcessor<PersistResult[]> PersistResultArray = new PersistResultArrayProcessor();
 
+        public static readonly ResultProcessor<BlessFlags> BlessFlags = new BlessFlagsProcessor();
+
         public static readonly ResultProcessor<RedisChannel[]>
             RedisChannelArrayLiteral = new RedisChannelArrayProcessor(RedisChannel.RedisChannelOptions.None);
 
@@ -565,7 +567,24 @@ namespace StackExchange.Redis
                                     case RedisCommand.SUBSCRIBE:
                                     case RedisCommand.SSUBSCRIBE:
                                     case RedisCommand.PSUBSCRIBE:
-                                        Subscription?.AddEndpoint(ep);
+                                        if (Subscription is { } sub && !sub.TryAdoptEndpoint(ep))
+                                        {
+                                            // the subscription is already confirmed on a different live server:
+                                            // this ack is a stray from an overlapping restore (#3336); remove
+                                            // the server-side registration it created, or it would deliver
+                                            // duplicate messages indefinitely (fire-and-forget: we are on the
+                                            // read loop, so we must not block)
+                                            if (message is Message.CommandChannelBase channelMessage)
+                                            {
+                                                var unsubscribe = sub.GetSubscriptionMessage(
+                                                    channelMessage.Channel,
+                                                    ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
+                                                    CommandFlags.FireAndForget,
+                                                    internalCall: true);
+                                                connection.BridgeCouldBeNull?.Multiplexer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                            }
+                                        }
+
                                         break;
                                     default:
                                         Subscription?.TryRemoveEndpoint(ep);
@@ -1825,6 +1844,27 @@ namespace StackExchange.Redis
                         },
                         scalar: true);
                     SetResult(message, arr!);
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        // BLESS GET: an array of active flag names; empty (not nil) for an unblessed key
+        private sealed class BlessFlagsProcessor : ResultProcessor<BlessFlags>
+        {
+            protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
+            {
+                if (reader.IsAggregate && !reader.IsNull)
+                {
+                    var result = StackExchange.Redis.BlessFlags.None;
+                    var iter = reader.AggregateChildren();
+                    while (iter.MoveNext())
+                    {
+                        // tokens from a newer server that we don't model are ignored, not fatal
+                        if (iter.Value.Is("NO-EVICT"u8)) result |= StackExchange.Redis.BlessFlags.NoEvict;
+                    }
+                    SetResult(message, result);
                     return true;
                 }
                 return false;
