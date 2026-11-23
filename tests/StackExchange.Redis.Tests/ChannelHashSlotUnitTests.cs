@@ -53,6 +53,31 @@ public class ChannelHashSlotUnitTests(ITestOutputHelper log)
     }
 
     [Fact]
+    public async Task LiteralChannelOnClusterHasSlotOfItsName()
+    {
+        using var server = new InProcessTestServer(log) { ServerType = ServerType.Cluster };
+        await using var conn = await ConnectToClusterAsync(server);
+
+        // regular pub/sub is broadcast cluster-wide by the server, but this client still routes the
+        // subscription via the channel's slot
+        var slot = conn.HashSlot(RedisChannel.Literal("hash-slot-channel"));
+
+        Assert.NotEqual(ServerSelectionStrategy.NoSlot, slot);
+        Assert.Equal(conn.HashSlot((RedisKey)"hash-slot-channel"), slot);
+    }
+
+    [Fact]
+    public async Task MultiNodeChannelsHaveNoSlot()
+    {
+        using var server = new InProcessTestServer(log) { ServerType = ServerType.Cluster };
+        await using var conn = await ConnectToClusterAsync(server);
+
+        // multi-node channels subscribe on every node without consulting a slot
+        Assert.Equal(ServerSelectionStrategy.NoSlot, conn.HashSlot(RedisChannel.KeySpacePattern("hash-slot-*", 0)));
+        Assert.Equal(ServerSelectionStrategy.NoSlot, conn.HashSlot(RedisChannel.KeySpacePrefix((RedisKey)"hash-slot:", 0)));
+    }
+
+    [Fact]
     public async Task StandaloneHasNoSlot()
     {
         using var server = new InProcessTestServer(log);
