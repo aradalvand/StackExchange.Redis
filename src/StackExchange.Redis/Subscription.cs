@@ -28,26 +28,32 @@ public partial class ConnectionMultiplexer
         // then never be invoked, since nothing routes messages to a retired subscription (and the server has been told
         // to stop sending them).
         private readonly object _registrationLock = new();
-        private bool _isRetired;
+        private int _isRetired;
 
         /// <summary>
         /// Held while retiring this subscription, see <see cref="TryAdd"/>.
         /// </summary>
         internal object RegistrationLock => _registrationLock;
 
-        internal bool IsRetired => _isRetired; // only meaningful while holding RegistrationLock
+        /// <summary>
+        /// Whether this subscription has been retired (its last handler/queue was removed, or it was explicitly
+        /// unsubscribed). Safely readable without holding <see cref="RegistrationLock"/>.
+        /// </summary>
+        internal bool IsRetired => Volatile.Read(ref _isRetired) != 0;
 
-        internal void MarkRetired() => _isRetired = true; // only to be called while holding RegistrationLock
+        internal void MarkRetired() => Interlocked.Exchange(ref _isRetired, 1);
 
         /// <summary>
         /// Adds a handler and/or queue, unless this subscription has been retired (in which case the caller should
-        /// look it up again, which yields a fresh one).
+        /// look it up again, which yields a fresh one). Note: a synchronous <c>Unsubscribe</c> holds
+        /// <see cref="RegistrationLock"/> across its round trip, so a concurrent <c>SubscribeAsync</c> to the same
+        /// channel will wait for it here.
         /// </summary>
         internal bool TryAdd(Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
         {
             lock (_registrationLock)
             {
-                if (_isRetired) return false;
+                if (IsRetired) return false;
                 Add(handler, queue);
                 return true;
             }
@@ -68,6 +74,20 @@ public partial class ConnectionMultiplexer
         internal abstract bool TryRemoveEndpoint(ServerEndPoint expected);
 
         internal abstract void RemoveDisconnectedEndpoints();
+
+        /// <summary>
+        /// Whether this active subscription is known not to want <paramref name="server"/> (e.g. a single-node
+        /// subscription already confirmed on a different live server, or a multi-node subscription whose server
+        /// filter excludes <paramref name="server"/>). Used to decide whether a retiring subscription for the same
+        /// channel can safely unsubscribe <paramref name="server"/> without disturbing this subscription.
+        /// </summary>
+        internal abstract bool DoesNotWantServer(ServerEndPoint server);
+
+        /// <summary>
+        /// Drives retirement for any server endpoints still recorded on this retired subscription.
+        /// </summary>
+        /// <returns><see langword="true"/> if any connected endpoints remain; <see langword="false"/> if retirement is complete.</returns>
+        internal abstract bool UnsubscribeRetiring(ConnectionMultiplexer multiplexer, in RedisChannel channel);
 
         // returns the number of changes required
         internal abstract int EnsureSubscribedToServer(
@@ -256,6 +276,7 @@ public partial class ConnectionMultiplexer
 
         internal override bool TryAdoptEndpoint(ServerEndPoint server)
         {
+            bool retired = IsRetired;
             bool adopted;
             var current = Volatile.Read(ref _currentServer);
             while (true)
@@ -271,7 +292,7 @@ public partial class ConnectionMultiplexer
                 var seen = Interlocked.CompareExchange(ref _currentServer, server, current);
                 if (seen == current)
                 {
-                    adopted = true;
+                    adopted = !retired;
                     break;
                 }
 
@@ -288,18 +309,32 @@ public partial class ConnectionMultiplexer
                 Interlocked.CompareExchange(ref _pending, null, pending);
             }
 
-            return adopted;
+            // Re-check IsRetired after publishing _currentServer (ordered via the Interlocked fence
+            // above against MarkRetired's Interlocked.Exchange + UnsubscribeFromServer's Volatile.Read):
+            // if retirement won the race and saw _currentServer == null, we must report false here so
+            // the caller cleans up this registration.
+            return adopted && !IsRetired;
         }
 
         internal override bool TryRemoveEndpoint(ServerEndPoint expected)
         {
-            if (_currentServer == expected)
-            {
-                _currentServer = null;
-                return true;
-            }
+            return Interlocked.CompareExchange(ref _currentServer, null, expected) == expected;
+        }
 
-            return false;
+        internal override bool DoesNotWantServer(ServerEndPoint server)
+        {
+            var current = Volatile.Read(ref _currentServer);
+            return current is { IsSubscriberConnected: true } && current != server;
+        }
+
+        internal override bool UnsubscribeRetiring(ConnectionMultiplexer multiplexer, in RedisChannel channel)
+        {
+            RemoveDisconnectedEndpoints();
+            var server = Volatile.Read(ref _currentServer);
+            if (server is not { IsSubscriberConnected: true }) return false;
+
+            multiplexer.TryUnsubscribeRetiringServer(this, channel, server);
+            return IsConnectedAny();
         }
 
         internal override bool UnsubscribeFromServer(
@@ -308,9 +343,11 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
-            var server = _currentServer;
+            MarkRetired();
+            var server = Volatile.Read(ref _currentServer);
             if (server is not null)
             {
+                subscriber.multiplexer.TrackRetiringSubscription(this, channel);
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
                 return subscriber.multiplexer.ExecuteSyncImpl(message, Processor, server);
             }
@@ -325,11 +362,23 @@ public partial class ConnectionMultiplexer
             object? asyncState,
             bool internalCall)
         {
-            var server = _currentServer;
+            MarkRetired();
+            var server = Volatile.Read(ref _currentServer);
             if (server is not null)
             {
+                subscriber.multiplexer.TrackRetiringSubscription(this, channel);
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
                 return subscriber.multiplexer.ExecuteAsyncImpl(message, Processor, asyncState, server);
+            }
+
+            // If a subscribe is still in flight on a server, queue the unsubscribe behind it on that
+            // same server so an async caller awaits the unsubscribe rather than returning early while
+            // the subscribe is still pending. When the subscribe ack lands, TryAdoptEndpoint also sees
+            // IsRetired and drives retirement if this unsubscribe was declined or skipped.
+            if (Volatile.Read(ref _pending) is { Server: var pendingServer })
+            {
+                var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
+                return subscriber.multiplexer.ExecuteAsyncImpl(message, Processor, asyncState, pendingServer);
             }
 
             return CompletedTask<bool>.FromResult(true, asyncState);
@@ -369,6 +418,7 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
+            if (IsRetired) return 0;
             RemoveIncorrectRouting(subscriber, in channel, flags, internalCall);
             if (IsConnectedAny()) return 0;
 
@@ -522,6 +572,7 @@ public partial class ConnectionMultiplexer
             if (claim is not null
                 && ReferenceEquals(Interlocked.CompareExchange(ref _pending, null, claim), claim)
                 && claim.TryTakeDeferred(out var subscriber, out var channel)
+                && !IsRetired
                 && !IsConnectedAny())
             {
                 // this attempt ended without a confirmed server (an ack clears the claim directly, in
@@ -574,6 +625,7 @@ public partial class ConnectionMultiplexer
             bool internalCall,
             ServerEndPoint? server = null)
         {
+            if (IsRetired) return 0;
             RemoveIncorrectRouting(subscriber, in channel, flags, internalCall);
             if (IsConnectedAny()) return 0;
 
@@ -670,19 +722,41 @@ public partial class ConnectionMultiplexer
 
         internal override bool TryAdoptEndpoint(ServerEndPoint server)
         {
-            // multi-node subscriptions want every eligible node, so an ack is never a stray
+            // multi-node subscriptions want every eligible node, so an ack is only a stray if retired
             var ep = server.EndPoint;
             if (!_servers.TryAdd(ep, server))
             {
                 _servers[ep] = server;
             }
 
-            return true;
+            return !IsRetired;
         }
 
         internal override bool TryRemoveEndpoint(ServerEndPoint expected)
         {
             return _servers.TryRemove(expected.EndPoint, out _);
+        }
+
+        internal override bool DoesNotWantServer(ServerEndPoint server)
+        {
+            bool useReplica = (Flags & CommandFlags.DemandReplica) != 0;
+            bool shouldBeConnected = (server.ServerType != ServerType.Sentinel) & (server.IsReplica == useReplica);
+            return !shouldBeConnected;
+        }
+
+        internal override bool UnsubscribeRetiring(ConnectionMultiplexer multiplexer, in RedisChannel channel)
+        {
+            RemoveDisconnectedEndpoints();
+            foreach (var pair in _servers)
+            {
+                var server = pair.Value;
+                if (server.IsSubscriberConnected)
+                {
+                    multiplexer.TryUnsubscribeRetiringServer(this, channel, server);
+                }
+            }
+
+            return IsConnectedAny();
         }
 
         internal override ServerEndPoint? GetAnyCurrentServer()
@@ -743,6 +817,7 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
+            if (IsRetired) return 0;
             int delta = 0;
             var muxer = subscriber.multiplexer;
             foreach (var server in muxer.GetServerSnapshot())
@@ -779,6 +854,7 @@ public partial class ConnectionMultiplexer
             bool internalCall,
             ServerEndPoint? server = null)
         {
+            if (IsRetired) return 0;
             int delta = 0;
             var muxer = subscriber.multiplexer;
             var snapshot = muxer.GetServerSnaphotMemory();
@@ -808,6 +884,12 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
+            MarkRetired();
+            if (!_servers.IsEmpty)
+            {
+                subscriber.multiplexer.TrackRetiringSubscription(this, channel);
+            }
+
             bool any = false;
             foreach (var server in _servers)
             {
@@ -825,6 +907,12 @@ public partial class ConnectionMultiplexer
             object? asyncState,
             bool internalCall)
         {
+            MarkRetired();
+            if (!_servers.IsEmpty)
+            {
+                subscriber.multiplexer.TrackRetiringSubscription(this, channel);
+            }
+
             // issue all of them before awaiting any, so that they are all issued synchronously (see RegistrationLock)
             var pending = new List<Task<bool>>();
             foreach (var server in _servers)

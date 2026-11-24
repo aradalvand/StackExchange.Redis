@@ -184,12 +184,128 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         Assert.Equal(0, Volatile.Read(ref stoppedDeliveries));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnsubscribeWaitsForAnInFlightSubscribe(bool pattern)
+    {
+        using var server = new PausedSubscribeServer(output);
+        await using var connection = await server.ConnectAsync();
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.channel");
+        var subscription = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        var firstServer = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var pending = subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true, firstServer);
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+            var unsubscribe = subscription.UnsubscribeFromServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, null, false);
+            Assert.False(unsubscribe.IsCompleted);
+            server.Release.Set();
+            await Task.WhenAll(pending, unsubscribe).WithTimeout(5000);
+            await server.FirstUnsubscribe.Task.WithTimeout(5000);
+            Assert.Null(subscription.GetAnyCurrentServer());
+            Assert.Equal(0, await subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true));
+        }
+        finally { server.Release.Set(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TimedOutSynchronousUnsubscribeStillDetachesThePendingSubscription(bool pattern)
+    {
+        using var server = new PausedSubscribeServer(output);
+        var config = server.GetClientConfig();
+        config.SyncTimeout = 100;
+        config.AsyncTimeout = 5000;
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(config);
+        var subscriber = connection.GetSubscriber();
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.channel");
+        var subscription = connection.GetOrAddSubscription(channel, CommandFlags.None);
+        subscription.Add((_, _) => { }, null);
+        var pending = subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, false,
+            connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured));
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+            subscriber.Unsubscribe(channel);
+            Assert.False(connection.TryGetSubscription(channel, out _));
+            server.Release.Set();
+            await pending.WithTimeout(5000);
+            await server.FirstUnsubscribe.Task.WithTimeout(5000);
+        }
+        finally { server.Release.Set(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnsubscribeAllContinuesPastAnInFlightSubscription(bool pattern)
+    {
+        using var server = new PausedSubscribeServer(output);
+        var config = server.GetClientConfig();
+        config.SyncTimeout = 100;
+        config.AsyncTimeout = 5000;
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(config);
+        var subscriber = connection.DefaultSubscriber;
+        var firstChannel = pattern ? RedisChannel.Pattern("restoration.first.*") : RedisChannel.Literal("restoration.first");
+        var secondChannel = pattern ? RedisChannel.Pattern("restoration.second.*") : RedisChannel.Literal("restoration.second");
+        var first = connection.GetOrAddSubscription(firstChannel, CommandFlags.None);
+        var second = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        var pending = first.EnsureSubscribedToServerAsync(subscriber, firstChannel, CommandFlags.None, false,
+            connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured));
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+            await second.EnsureSubscribedToServerAsync(subscriber, secondChannel, CommandFlags.None, false,
+                connection.GetServerEndPoint(server.SecondEndPoint, ServerProvenance.Configured)).WithTimeout(5000);
+            Assert.True(connection.GetSubscriptions().TryAdd(secondChannel, second));
+            subscriber.UnsubscribeAll();
+            Assert.False(connection.TryGetSubscription(firstChannel, out _));
+            Assert.False(connection.TryGetSubscription(secondChannel, out _));
+            server.Release.Set();
+            await pending.WithTimeout(5000);
+            Assert.True(await Poll.UntilAsync(() => Volatile.Read(ref server.UnsubscribeCount) >= 2, timeoutMilliseconds: 5000));
+        }
+        finally { server.Release.Set(); }
+    }
+
+    [Fact]
+    public async Task LateCleanupDoesNotUnsubscribeTheReplacementOwner()
+    {
+        using var server = new PausedSubscribeServer(output);
+        await using var connection = await server.ConnectAsync();
+        var channel = RedisChannel.Literal("restoration.owner");
+        var old = connection.GetOrAddSubscription(channel, CommandFlags.None);
+        var first = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var second = connection.GetServerEndPoint(server.SecondEndPoint, ServerProvenance.Configured);
+        var pending = old.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true, first);
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+            await connection.GetSubscriber().UnsubscribeAsync(channel, flags: CommandFlags.FireAndForget);
+            var replacement = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+            var received = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            replacement.Add((_, value) => { if (value == "new-owner") received.TrySetResult(true); }, null);
+            await replacement.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true, second);
+            Assert.True(connection.GetSubscriptions().TryAdd(channel, replacement));
+            server.Release.Set();
+            await pending.WithTimeout(5000);
+            await server.FirstUnsubscribe.Task.WithTimeout(5000);
+            Assert.True(replacement.IsConnectedAny());
+            Assert.Same(second, replacement.GetAnyCurrentServer());
+            await connection.GetDatabase().PublishAsync(channel, "new-owner");
+            await received.Task.WithTimeout(5000);
+        }
+        finally { server.Release.Set(); }
+    }
+
     private sealed class PausedSubscribeServer : InProcessTestServer
     {
         public EndPoint SecondEndPoint { get; }
         public readonly ManualResetEventSlim Release = new();
         public readonly TaskCompletionSource<bool> FirstSubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public int FirstSubscribeCount, SecondSubscribeCount;
+        public int FirstSubscribeCount, SecondSubscribeCount, UnsubscribeCount;
         public bool FailFirstSubscribe;
         public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -218,6 +334,7 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
                 && request.GetString(1).StartsWith("restoration.", StringComparison.Ordinal))
             {
                 TryGetNode(DefaultEndPoint, out var firstNode);
+                Interlocked.Increment(ref UnsubscribeCount);
                 if (ReferenceEquals(client.Node, firstNode)) FirstUnsubscribe.TrySetResult(true);
             }
             return result;

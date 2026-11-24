@@ -13,6 +13,7 @@ namespace StackExchange.Redis
         internal RedisSubscriber DefaultSubscriber => _defaultSubscriber ??= new RedisSubscriber(this, null);
 
         private readonly ConcurrentDictionary<RedisChannel, Subscription> subscriptions = new();
+        private readonly ConcurrentDictionary<Subscription, RedisChannel> _retiringSubscriptions = new();
 
         internal ConcurrentDictionary<RedisChannel, Subscription> GetSubscriptions() => subscriptions;
         ConcurrentDictionary<RedisChannel, Subscription> IInternalConnectionMultiplexer.GetSubscriptions() => GetSubscriptions();
@@ -109,6 +110,98 @@ namespace StackExchange.Redis
             }
         }
 
+        internal void TrackRetiringSubscription(Subscription sub, in RedisChannel channel)
+            => _retiringSubscriptions.TryAdd(sub, channel);
+
+        internal void UntrackRetiringSubscription(Subscription sub)
+            => _retiringSubscriptions.TryRemove(sub, out _);
+
+        /// <summary>
+        /// Drives pending unsubscribes for retired subscriptions whose server-side unsubscribes have not yet been
+        /// confirmed (for example because the server declined with <c>BUSY</c>, or the unsubscribe timed out, or a
+        /// subscribe was still in flight when the channel was unsubscribed). Called from the heartbeat and restore
+        /// paths so retries stay tied to the multiplexer lifecycle.
+        /// </summary>
+        internal void ProcessRetiringSubscriptions()
+        {
+            if (_isDisposed || _retiringSubscriptions.IsEmpty) return;
+
+            foreach (var pair in _retiringSubscriptions)
+            {
+                var sub = pair.Key;
+                try
+                {
+                    if (!sub.UnsubscribeRetiring(this, pair.Value))
+                    {
+                        _retiringSubscriptions.TryRemove(sub, out _);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!_isDisposed) OnInternalError(ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Attempts to send a fire-and-forget unsubscribe for <paramref name="retired"/> on <paramref name="server"/>,
+        /// unless a newer active subscription for <paramref name="channel"/> already owns (or may yet claim) that
+        /// server. When no active subscription exists, the command is issued while holding <c>lock (subscriptions)</c>
+        /// so any subsequent subscribe to <paramref name="channel"/> issues its <c>SUBSCRIBE</c> after this
+        /// <c>UNSUBSCRIBE</c>.
+        /// </summary>
+        internal void TryUnsubscribeRetiringServer(Subscription retired, in RedisChannel channel, ServerEndPoint server)
+        {
+            if (_isDisposed || !server.IsSubscriberConnected) return;
+
+            bool shouldSend = false;
+            lock (subscriptions)
+            {
+                if (!subscriptions.TryGetValue(channel, out var active) || active.IsRetired)
+                {
+                    SendRetiringUnsubscribe(retired, channel, server);
+                    return;
+                }
+
+                if (active.IsConnectedTo(server.EndPoint))
+                {
+                    // A newer subscription already owns this channel on this server; client and server agree.
+                    retired.TryRemoveEndpoint(server);
+                    return;
+                }
+
+                // If the active subscription is confirmed elsewhere (and doesn't want this server),
+                // this server's registration is stray and safe to unsubscribe without touching active.
+                if (active.DoesNotWantServer(server))
+                {
+                    shouldSend = true;
+                }
+                // Otherwise, active is still connecting and may land on this server; defer to the next heartbeat.
+            }
+
+            if (shouldSend)
+            {
+                SendRetiringUnsubscribe(retired, channel, server);
+            }
+        }
+
+        private void SendRetiringUnsubscribe(Subscription retired, in RedisChannel channel, ServerEndPoint server)
+        {
+            try
+            {
+                var msg = retired.GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, CommandFlags.FireAndForget, internalCall: true);
+                ExecuteSyncImpl(msg, retired.Processor, server);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Multiplexer shut down concurrently; server drops subscriptions with the connection.
+            }
+            catch (Exception ex)
+            {
+                if (!_isDisposed) OnInternalError(ex);
+            }
+        }
+
         /// <summary>
         /// Updates all subscriptions re-evaluating their state.
         /// This clears the current server if it's not connected, prepping them to reconnect.
@@ -118,6 +211,19 @@ namespace StackExchange.Redis
             foreach (var pair in subscriptions)
             {
                 pair.Value.RemoveDisconnectedEndpoints();
+            }
+
+            if (!_retiringSubscriptions.IsEmpty)
+            {
+                foreach (var pair in _retiringSubscriptions)
+                {
+                    var sub = pair.Key;
+                    sub.RemoveDisconnectedEndpoints();
+                    if (!sub.IsConnectedAny())
+                    {
+                        _retiringSubscriptions.TryRemove(sub, out _);
+                    }
+                }
             }
         }
 
@@ -132,6 +238,7 @@ namespace StackExchange.Redis
             var subscriber = DefaultSubscriber;
             foreach (var pair in subscriptions)
             {
+                if (pair.Value.IsRetired) continue;
                 try
                 {
                     count += pair.Value.EnsureSubscribedToServer(subscriber, pair.Key, flags, true);
@@ -141,6 +248,8 @@ namespace StackExchange.Redis
                     OnInternalError(ex);
                 }
             }
+
+            ProcessRetiringSubscriptions();
             return count;
         }
 
@@ -270,6 +379,8 @@ namespace StackExchange.Redis
 
         internal void ResubscribeToServer(Subscription sub, in RedisChannel channel, ServerEndPoint serverEndPoint, string cause)
         {
+            if (sub.IsRetired) return;
+
             // conditional: only if that's the server we were connected to, or "none"; we don't want to end up duplicated
             if (sub.TryRemoveEndpoint(serverEndPoint) || !sub.IsConnectedAny())
             {

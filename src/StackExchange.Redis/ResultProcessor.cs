@@ -569,25 +569,46 @@ namespace StackExchange.Redis
                                     case RedisCommand.PSUBSCRIBE:
                                         if (Subscription is { } sub && !sub.TryAdoptEndpoint(ep))
                                         {
-                                            // the subscription is already confirmed on a different live server:
-                                            // this ack is a stray from an overlapping restore (#3336); remove
-                                            // the server-side registration it created, or it would deliver
-                                            // duplicate messages indefinitely (fire-and-forget: we are on the
-                                            // read loop, so we must not block)
-                                            if (message is Message.CommandChannelBase channelMessage)
+                                            // the subscription is either retired (unsubscribed while this subscribe
+                                            // was in flight) or already confirmed on a different live server (stray
+                                            // from an overlapping restore, #3336); remove the server-side registration
+                                            // it created, or it would deliver stray/duplicate messages indefinitely
+                                            // (fire-and-forget: we are on the read loop, so we must not block)
+                                            if (message is Message.CommandChannelBase channelMessage
+                                                && connection.BridgeCouldBeNull?.Multiplexer is { } muxer)
                                             {
-                                                var unsubscribe = sub.GetSubscriptionMessage(
-                                                    channelMessage.Channel,
-                                                    ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
-                                                    CommandFlags.FireAndForget,
-                                                    internalCall: true);
-                                                connection.BridgeCouldBeNull?.Multiplexer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                                if (sub.IsRetired)
+                                                {
+                                                    muxer.TrackRetiringSubscription(sub, channelMessage.Channel);
+                                                    muxer.TryUnsubscribeRetiringServer(sub, channelMessage.Channel, ep);
+                                                    if (!sub.IsConnectedAny())
+                                                    {
+                                                        muxer.UntrackRetiringSubscription(sub);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    var unsubscribe = sub.GetSubscriptionMessage(
+                                                        channelMessage.Channel,
+                                                        ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
+                                                        CommandFlags.FireAndForget,
+                                                        internalCall: true);
+                                                    muxer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                                }
                                             }
                                         }
 
                                         break;
                                     default:
-                                        Subscription?.TryRemoveEndpoint(ep);
+                                        if (Subscription is { } unsub)
+                                        {
+                                            unsub.TryRemoveEndpoint(ep);
+                                            if (unsub.IsRetired && !unsub.IsConnectedAny())
+                                            {
+                                                connection.BridgeCouldBeNull?.Multiplexer.UntrackRetiringSubscription(unsub);
+                                            }
+                                        }
+
                                         break;
                                 }
                             }
