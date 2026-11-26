@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 using static StackExchange.Redis.ConnectionMultiplexer;
 
@@ -131,6 +132,17 @@ namespace StackExchange.Redis
                 var sub = pair.Key;
                 try
                 {
+                    sub.RemoveDisconnectedEndpoints();
+                    if (!sub.IsConnectedAny())
+                    {
+                        _retiringSubscriptions.TryRemove(sub, out _);
+                        continue;
+                    }
+
+                    // Only re-issue once a failure, timeout, or deferral has actually been observed;
+                    // do not re-send unsubscribes that are merely waiting for a slow server's reply.
+                    if (!sub.TryTakeUnsubscribeRetryNeeded()) continue;
+
                     if (!sub.UnsubscribeRetiring(this, pair.Value))
                     {
                         _retiringSubscriptions.TryRemove(sub, out _);
@@ -146,15 +158,16 @@ namespace StackExchange.Redis
         /// <summary>
         /// Attempts to send a fire-and-forget unsubscribe for <paramref name="retired"/> on <paramref name="server"/>,
         /// unless a newer active subscription for <paramref name="channel"/> already owns (or may yet claim) that
-        /// server. When no active subscription exists, the command is issued while holding <c>lock (subscriptions)</c>
-        /// so any subsequent subscribe to <paramref name="channel"/> issues its <c>SUBSCRIBE</c> after this
-        /// <c>UNSUBSCRIBE</c>.
+        /// server. Both send branches issue the non-blocking fire-and-forget write while holding
+        /// <c>lock (subscriptions)</c> so any new <see cref="GetOrAddSubscription"/> for <paramref name="channel"/>
+        /// issues its <c>SUBSCRIBE</c> after this <c>UNSUBSCRIBE</c>; if a lock-free restore races and moves an
+        /// existing active subscription onto <paramref name="server"/>, <see cref="ResultProcessor.TrackSubscriptionsProcessor"/>
+        /// self-corrects when the <c>UNSUBSCRIBE</c> reply arrives.
         /// </summary>
         internal void TryUnsubscribeRetiringServer(Subscription retired, in RedisChannel channel, ServerEndPoint server)
         {
             if (_isDisposed || !server.IsSubscriberConnected) return;
 
-            bool shouldSend = false;
             lock (subscriptions)
             {
                 if (!subscriptions.TryGetValue(channel, out var active) || active.IsRetired)
@@ -174,14 +187,13 @@ namespace StackExchange.Redis
                 // this server's registration is stray and safe to unsubscribe without touching active.
                 if (active.DoesNotWantServer(server))
                 {
-                    shouldSend = true;
+                    SendRetiringUnsubscribe(retired, channel, server);
+                    return;
                 }
-                // Otherwise, active is still connecting and may land on this server; defer to the next heartbeat.
-            }
 
-            if (shouldSend)
-            {
-                SendRetiringUnsubscribe(retired, channel, server);
+                // Otherwise, active is still connecting and may land on this server; defer to the next heartbeat.
+                retired.MarkUnsubscribeRetryNeeded();
+                TrackRetiringSubscription(retired, channel);
             }
         }
 
@@ -190,7 +202,16 @@ namespace StackExchange.Redis
             try
             {
                 var msg = retired.GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, CommandFlags.FireAndForget, internalCall: true);
-                ExecuteSyncImpl(msg, retired.Processor, server);
+                var target = server;
+#pragma warning disable CS0618 // Type or member is obsolete
+                var writeResult = TryPushMessageToBridgeSync(msg, retired.Processor, null, ref target);
+#pragma warning restore CS0618
+                Interlocked.Increment(ref fireAndForgets);
+                if (writeResult != WriteResult.Success && server.IsSubscriberConnected)
+                {
+                    retired.MarkUnsubscribeRetryNeeded();
+                    TrackRetiringSubscription(retired, channel);
+                }
             }
             catch (ObjectDisposedException)
             {
@@ -198,7 +219,16 @@ namespace StackExchange.Redis
             }
             catch (Exception ex)
             {
-                if (!_isDisposed) OnInternalError(ex);
+                if (!_isDisposed)
+                {
+                    if (server.IsSubscriberConnected)
+                    {
+                        retired.MarkUnsubscribeRetryNeeded();
+                        TrackRetiringSubscription(retired, channel);
+                    }
+
+                    OnInternalError(ex);
+                }
             }
         }
 

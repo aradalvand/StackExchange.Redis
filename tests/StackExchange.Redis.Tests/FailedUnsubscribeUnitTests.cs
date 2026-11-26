@@ -19,11 +19,16 @@ public class FailedUnsubscribeUnitTests(ITestOutputHelper log)
     {
         private int _refusals;
         private int _pauseFirstUnsubscribe;
+        private int _unsubscribeDelayMs;
+        public int UnsubscribeCount;
         public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly ManualResetEventSlim Release = new(initialState: true);
 
         /// <summary>Makes the server reply <c>BUSY</c> to the next <paramref name="count"/> unsubscribes.</summary>
         public void RefuseUnsubscribes(int count) => Volatile.Write(ref _refusals, count);
+
+        /// <summary>Delays each unsubscribe reply by <paramref name="milliseconds"/>.</summary>
+        public void DelayUnsubscribes(int milliseconds) => Volatile.Write(ref _unsubscribeDelayMs, milliseconds);
 
         /// <summary>Pauses the next unsubscribe until <see cref="Release"/> is set, then replies <c>BUSY</c>.</summary>
         public void PauseAndRefuseNextUnsubscribe()
@@ -32,19 +37,38 @@ public class FailedUnsubscribeUnitTests(ITestOutputHelper log)
             Volatile.Write(ref _pauseFirstUnsubscribe, 1);
         }
 
-        protected override TypedRedisValue Unsubscribe(RedisClient client, in RedisRequest request)
+        private bool TryInterceptUnsubscribe(out TypedRedisValue reply)
         {
+            Interlocked.Increment(ref UnsubscribeCount);
             if (Interlocked.Exchange(ref _pauseFirstUnsubscribe, 0) != 0)
             {
                 FirstUnsubscribe.TrySetResult(true);
                 if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test unsubscribe barrier timed out.");
-                return TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.");
+                reply = TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.");
+                return true;
             }
 
-            return Interlocked.Decrement(ref _refusals) >= 0
-                ? TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.")
-                : base.Unsubscribe(client, request);
+            var delayMs = Volatile.Read(ref _unsubscribeDelayMs);
+            if (delayMs > 0)
+            {
+                Thread.Sleep(delayMs);
+            }
+
+            if (Interlocked.Decrement(ref _refusals) >= 0)
+            {
+                reply = TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.");
+                return true;
+            }
+
+            reply = default;
+            return false;
         }
+
+        protected override TypedRedisValue Unsubscribe(RedisClient client, in RedisRequest request)
+            => TryInterceptUnsubscribe(out var reply) ? reply : base.Unsubscribe(client, request);
+
+        protected override TypedRedisValue PUnsubscribe(RedisClient client, in RedisRequest request)
+            => TryInterceptUnsubscribe(out var reply) ? reply : base.PUnsubscribe(client, request);
     }
 
     private static async Task<long> PublishUntil(ISubscriber subscriber, RedisChannel channel, Func<long, bool> condition)
@@ -120,11 +144,37 @@ public class FailedUnsubscribeUnitTests(ITestOutputHelper log)
     }
 
     [Fact]
+    public async Task DeclinedMultiNodeLastUnsubscribeIsRetried()
+    {
+        using var server = new BusyServer(log);
+        server.AddEmptyNode();
+        var config = server.GetClientConfig();
+        config.HeartbeatInterval = TimeSpan.FromMilliseconds(100);
+        await using var conn = await ConnectionMultiplexer.ConnectAsync(config);
+        var subscriber = conn.GetSubscriber();
+        var channel = RedisChannel.KeySpacePrefix($"{nameof(DeclinedMultiNodeLastUnsubscribeIsRetried)}:", 0);
+        var probe = RedisChannel.Literal($"__keyspace@0__:{nameof(DeclinedMultiNodeLastUnsubscribeIsRetried)}:probe");
+        Action<RedisChannel, RedisValue> handler = static (_, _) => { };
+
+        await subscriber.SubscribeAsync(channel, handler);
+        Assert.True(conn.TryGetSubscription(channel, out var sub));
+        Assert.IsType<ConnectionMultiplexer.MultiNodeSubscription>(sub);
+        Assert.Equal(2, sub.GetConnectionCount());
+        Assert.Equal(2, await subscriber.PublishAsync(probe, "on"));
+
+        server.RefuseUnsubscribes(3);
+        var ex = await Assert.ThrowsAsync<RedisServerException>(() => subscriber.UnsubscribeAsync(channel, handler));
+        Assert.Equal(RedisErrorKind.Busy, ex.Kind);
+
+        Assert.Equal(0, await PublishUntil(subscriber, probe, static count => count == 0));
+    }
+
+    [Fact]
     public async Task TimedOutThenDeclinedLastUnsubscribeIsRetried()
     {
         using var server = new BusyServer(log);
         var config = server.GetClientConfig();
-        config.AsyncTimeout = 200;
+        config.AsyncTimeout = 500;
         config.HeartbeatInterval = TimeSpan.FromMilliseconds(100);
         await using var conn = await ConnectionMultiplexer.ConnectAsync(config);
         var subscriber = conn.GetSubscriber();
@@ -148,6 +198,30 @@ public class FailedUnsubscribeUnitTests(ITestOutputHelper log)
         {
             server.Release.Set();
         }
+    }
+
+    [Fact]
+    public async Task SlowUnsubscribeIsNotResentByHeartbeat()
+    {
+        using var server = new BusyServer(log);
+        var config = server.GetClientConfig();
+        config.HeartbeatInterval = TimeSpan.FromMilliseconds(50);
+        await using var conn = await ConnectionMultiplexer.ConnectAsync(config);
+        var subscriber = conn.GetSubscriber();
+        var channel = RedisChannel.Literal(nameof(SlowUnsubscribeIsNotResentByHeartbeat));
+        Action<RedisChannel, RedisValue> handler = static (_, _) => { };
+
+        await subscriber.SubscribeAsync(channel, handler);
+        Assert.Equal(1, await subscriber.PublishAsync(channel, "subscribed"));
+
+        // Multiple heartbeats will fire while this unsubscribe is merely waiting for its reply;
+        // none of them should send a duplicate UNSUBSCRIBE.
+        server.DelayUnsubscribes(400);
+        await subscriber.UnsubscribeAsync(channel, handler);
+        await Task.Delay(150);
+
+        Assert.Equal(1, Volatile.Read(ref server.UnsubscribeCount));
+        Assert.Equal(0, await subscriber.PublishAsync(channel, "unsubscribed"));
     }
 
     [Fact]
@@ -175,6 +249,41 @@ public class FailedUnsubscribeUnitTests(ITestOutputHelper log)
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
         while (Volatile.Read(ref received) == 0 && DateTime.UtcNow < deadline) await Task.Delay(20);
         Assert.Equal(1, Volatile.Read(ref received));
+    }
+
+    [Fact]
+    public async Task RetiredUnsubscribeOvertakingActiveSubscriptionSelfCorrects()
+    {
+        // Forces the ordering race where an older retired subscription's UNSUBSCRIBE lands on server S
+        // after a newer active subscription for the same channel has moved onto S: the server drops the
+        // channel, and the UNSUBSCRIBE reply must self-correct by clearing S from the active subscription
+        // and re-subscribing it instead of failing silently.
+        using var server = new InProcessTestServer(log);
+        await using var conn = await server.ConnectAsync();
+        var subscriber = conn.GetSubscriber();
+        var channel = RedisChannel.Literal(nameof(RetiredUnsubscribeOvertakingActiveSubscriptionSelfCorrects));
+        var nodeS = conn.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+
+        var received = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await subscriber.SubscribeAsync(channel, (_, value) =>
+        {
+            if (value == "after-race") received.TrySetResult(true);
+        });
+        Assert.True(conn.TryGetSubscription(channel, out var active));
+        Assert.Same(nodeS, active.GetAnyCurrentServer());
+
+        // Simulate a retired older subscription whose UNSUBSCRIBE arrives at S after `active` is on S.
+        var retired = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        Assert.True(retired.TryAdoptEndpoint(nodeS));
+        retired.MarkRetired();
+        var overtakingUnsub = retired.GetSubscriptionMessage(channel, ConnectionMultiplexer.SubscriptionAction.Unsubscribe, CommandFlags.None, internalCall: true);
+        await conn.ExecuteAsyncImpl(overtakingUnsub, retired.Processor, null, nodeS).WithTimeout(5000);
+
+        // The UNSUBSCRIBE reply must have re-subscribed `active` on S so messages are not silently lost.
+        Assert.True(await Poll.UntilAsync(() => active.IsConnectedTo(nodeS.EndPoint), timeoutMilliseconds: 5000));
+        Assert.Equal(1, await PublishUntil(subscriber, channel, static count => count == 1));
+        await subscriber.PublishAsync(channel, "after-race");
+        await received.Task.WithTimeout(5000);
     }
 
     [Fact]
