@@ -602,20 +602,33 @@ namespace StackExchange.Redis
                                                 if (sub.IsRetired)
                                                 {
                                                     muxer.TrackRetiringSubscription(sub, channelMessage.Channel);
-                                                    muxer.TryUnsubscribeRetiringServer(sub, channelMessage.Channel, ep);
-                                                    if (!sub.IsConnectedAny())
+                                                    if (!sub.TryConsumePendingUnsubscribe(ep))
                                                     {
-                                                        muxer.UntrackRetiringSubscription(sub);
+                                                        // No unsubscribe was queued behind this in-flight subscribe;
+                                                        // issue it now (if one *was* queued, skip sending a duplicate
+                                                        // and rely on SetResult / ObserveUnsubscribeFault should it fail).
+                                                        muxer.TryUnsubscribeRetiringServer(sub, channelMessage.Channel, ep);
+                                                        if (!sub.IsConnectedAny())
+                                                        {
+                                                            muxer.UntrackRetiringSubscription(sub);
+                                                        }
                                                     }
                                                 }
                                                 else
                                                 {
-                                                    var unsubscribe = sub.GetSubscriptionMessage(
-                                                        channelMessage.Channel,
-                                                        ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
-                                                        CommandFlags.FireAndForget,
-                                                        internalCall: true);
-                                                    muxer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                                    // Stray registration on ep for a live subscription confirmed on
+                                                    // another server (#3336 / #3375 item 3): track it as a retired
+                                                    // single-node record so that if ep declines the unsubscribe (e.g.
+                                                    // BUSY), the heartbeat/restore path retries it until confirmed.
+                                                    var stray = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+                                                    stray.TryAdoptEndpoint(ep);
+                                                    stray.MarkRetired();
+                                                    muxer.TrackRetiringSubscription(stray, channelMessage.Channel);
+                                                    muxer.TryUnsubscribeRetiringServer(stray, channelMessage.Channel, ep);
+                                                    if (!stray.IsConnectedAny())
+                                                    {
+                                                        muxer.UntrackRetiringSubscription(stray);
+                                                    }
                                                 }
                                             }
                                         }

@@ -90,6 +90,10 @@ public partial class ConnectionMultiplexer
         // for an endpoint whose subscribe ack may have been dropped (e.g. timed-out subscribe)
         internal abstract void RecordRetiringEndpoint(ServerEndPoint server);
 
+        // returns true once if an unsubscribe was already queued behind an in-flight subscribe on server,
+        // so the subscribe ack path can skip sending a duplicate unsubscribe
+        internal virtual bool TryConsumePendingUnsubscribe(ServerEndPoint server) => false;
+
         internal abstract void RemoveDisconnectedEndpoints();
 
         /// <summary>
@@ -382,6 +386,9 @@ public partial class ConnectionMultiplexer
             return IsConnectedAny();
         }
 
+        internal override bool TryConsumePendingUnsubscribe(ServerEndPoint server)
+            => Interlocked.CompareExchange(ref _pendingUnsubscribeServer, null, server) == server;
+
         internal override bool UnsubscribeFromServer(
             RedisSubscriber subscriber,
             in RedisChannel channel,
@@ -414,8 +421,17 @@ public partial class ConnectionMultiplexer
             // rely solely on the subscribe's ack, which Message.ComputeResult drops if the subscribe times out.
             if (Volatile.Read(ref _pending) is { Server: var pendingServer })
             {
+                Volatile.Write(ref _pendingUnsubscribeServer, pendingServer);
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags | CommandFlags.FireAndForget, internalCall);
-                subscriber.multiplexer.ExecuteSyncImpl(message, Processor, pendingServer);
+                try
+                {
+                    subscriber.multiplexer.ExecuteSyncImpl(message, Processor, pendingServer);
+                }
+                catch
+                {
+                    Interlocked.CompareExchange(ref _pendingUnsubscribeServer, null, pendingServer);
+                    throw;
+                }
             }
 
             return true;
@@ -444,16 +460,26 @@ public partial class ConnectionMultiplexer
             // IsRetired and drives retirement if this unsubscribe was declined or skipped.
             if (Volatile.Read(ref _pending) is { Server: var pendingServer })
             {
+                Volatile.Write(ref _pendingUnsubscribeServer, pendingServer);
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                var task = subscriber.multiplexer.ExecuteAsyncImpl(message, Processor, asyncState, pendingServer);
-                ObserveUnsubscribeFault(task, subscriber.multiplexer, channel, pendingServer);
-                return task;
+                try
+                {
+                    var task = subscriber.multiplexer.ExecuteAsyncImpl(message, Processor, asyncState, pendingServer);
+                    ObserveUnsubscribeFault(task, subscriber.multiplexer, channel, pendingServer);
+                    return task;
+                }
+                catch
+                {
+                    Interlocked.CompareExchange(ref _pendingUnsubscribeServer, null, pendingServer);
+                    throw;
+                }
             }
 
             return CompletedTask<bool>.FromResult(true, asyncState);
         }
 
         private ServerEndPoint? _currentServer;
+        private ServerEndPoint? _pendingUnsubscribeServer;
 
         // an in-flight subscribe attempt; while one is pending, other restore attempts back off,
         // so that overlapping restores (reconnect + reconfigure racing during a failover) cannot

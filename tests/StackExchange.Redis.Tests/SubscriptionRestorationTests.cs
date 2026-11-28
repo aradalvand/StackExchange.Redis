@@ -207,6 +207,7 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
             Assert.Null(subscription.GetAnyCurrentServer());
             Assert.Equal(0, await subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true));
             Assert.Equal(0, await PublishUntilZeroAsync(connection, firstServer, probe));
+            Assert.Equal(1, Volatile.Read(ref server.UnsubscribeCount));
         }
         finally { server.Release.Set(); }
     }
@@ -237,6 +238,7 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
             await pending.WithTimeout(5000);
             await server.FirstUnsubscribe.Task.WithTimeout(5000);
             Assert.Equal(0, await PublishUntilZeroAsync(connection, firstServer, probe));
+            Assert.Equal(1, Volatile.Read(ref server.UnsubscribeCount));
         }
         finally { server.Release.Set(); }
     }
@@ -357,6 +359,63 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         return count;
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeclinedStrayCleanupIsRetried(bool pattern)
+    {
+        // A live subscription confirmed on firstServer receives a stray subscribe ack from secondServer
+        // (the #3336 overlapping-restore scenario). If secondServer declines the cleanup unsubscribe
+        // (e.g. BUSY), the heartbeat must retry it until secondServer unsubscribes, leaving only
+        // firstServer subscribed (no duplicate delivery).
+        using var server = new PausedSubscribeServer(output);
+        server.Release.Set();
+        var config = server.GetClientConfig();
+        config.HeartbeatInterval = TimeSpan.FromMilliseconds(100);
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(config);
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.stray");
+        var probe = pattern ? RedisChannel.Literal("restoration.stray") : channel;
+        var subscription = connection.GetOrAddSubscription(channel, CommandFlags.None);
+        int deliveries = 0;
+        var delivered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        subscription.Add((_, value) =>
+        {
+            if (value == "after-cleanup")
+            {
+                Interlocked.Increment(ref deliveries);
+                delivered.TrySetResult(true);
+            }
+        }, null);
+
+        var firstServer = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var secondServer = connection.GetServerEndPoint(server.SecondEndPoint, ServerProvenance.Configured);
+
+        await subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, false, firstServer).WithTimeout(5000);
+        Assert.Same(firstServer, subscription.GetAnyCurrentServer());
+
+        // Make secondServer decline the first 3 cleanup unsubscribes with BUSY, then inject a stray subscribe on it.
+        server.RefuseSecondUnsubscribes(3);
+        var stray = subscription.GetSubscriptionMessage(channel, ConnectionMultiplexer.SubscriptionAction.Subscribe, CommandFlags.None, internalCall: true);
+        await connection.ExecuteAsyncImpl(stray, subscription.Processor, null, secondServer).WithTimeout(5000);
+
+        // Heartbeat retries until secondServer accepts the unsubscribe and only firstServer remains subscribed.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        long count;
+        do
+        {
+            count = await connection.ExecuteAsyncImpl(Message.Create(-1, CommandFlags.None, RedisCommand.PUBLISH, probe, "probe"), ResultProcessor.Int64, null, firstServer);
+            if (count == 1) break;
+            await Task.Delay(50);
+        }
+        while (DateTime.UtcNow < deadline);
+
+        Assert.Equal(1, count);
+        Assert.Same(firstServer, subscription.GetAnyCurrentServer());
+        Assert.Equal(1, await connection.ExecuteAsyncImpl(Message.Create(-1, CommandFlags.None, RedisCommand.PUBLISH, probe, "after-cleanup"), ResultProcessor.Int64, null, firstServer));
+        await delivered.Task.WithTimeout(5000);
+        Assert.Equal(1, Volatile.Read(ref deliveries));
+    }
+
     private sealed class PausedSubscribeServer : InProcessTestServer
     {
         public EndPoint SecondEndPoint { get; }
@@ -364,9 +423,12 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         public readonly TaskCompletionSource<bool> FirstSubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int FirstSubscribeCount, SecondSubscribeCount, UnsubscribeCount;
         public bool FailFirstSubscribe;
+        private int _secondUnsubscribeRefusals;
         public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public PausedSubscribeServer(ITestOutputHelper output) : base(output) => SecondEndPoint = AddEmptyNode();
+
+        public void RefuseSecondUnsubscribes(int count) => Volatile.Write(ref _secondUnsubscribeRefusals, count);
 
         public override TypedRedisValue Execute(RedisClient client, in RedisRequest request)
         {
@@ -384,6 +446,15 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
                 else
                 {
                     Interlocked.Increment(ref SecondSubscribeCount);
+                }
+            }
+            if ((request.IsString(0, "UNSUBSCRIBE"u8) || request.IsString(0, "PUNSUBSCRIBE"u8))
+                && request.GetString(1).StartsWith("restoration.", StringComparison.Ordinal))
+            {
+                TryGetNode(DefaultEndPoint, out var firstNode);
+                if (!ReferenceEquals(client.Node, firstNode) && Interlocked.Decrement(ref _secondUnsubscribeRefusals) >= 0)
+                {
+                    return TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.");
                 }
             }
             var result = base.Execute(client, in request);
